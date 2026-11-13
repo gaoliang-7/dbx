@@ -28,6 +28,9 @@ export const DateTimePatterns = [
   "YYYY/MM/DDTHH:mm:ssZ",
   "YYYY/MM/DDTHH:mm:ss.SSSZ",
 ];
+// Keep global date-time formats compatible with the backend; the data grid can
+// additionally render Day.js 12-hour display patterns locally.
+export const DataGridDateTimePatterns = [...DateTimePatterns, "YYYY-MM-DD hh:mm:ss A"];
 const SUPPORTED_DATE_TIME_PATTERN_TOKENS = ["YYYY", "SSS", "ZZ", "MM", "DD", "HH", "mm", "ss", "M", "D", "H", "m", "s", "Z"];
 const STRICT_LOCAL_DATETIME_INPUT_PATTERNS = [
   "YYYY-MM-DD",
@@ -72,6 +75,14 @@ interface IntlTimeZoneSupport {
   supportedValuesOf?: (key: "timeZone") => string[];
 }
 
+const TIME_ZONE_DISPLAY_ALIASES: Record<string, string> = {
+  "Asia/Calcutta": "Asia/Kolkata",
+};
+
+export function displayTimeZoneOption(timeZone: string): string {
+  return TIME_ZONE_DISPLAY_ALIASES[timeZone] ?? timeZone;
+}
+
 export function getSupportedTimeZoneOptions(intl: IntlTimeZoneSupport, fallbackTimeZone = "UTC"): string[] {
   try {
     const timeZones = intl.supportedValuesOf?.("timeZone");
@@ -113,6 +124,7 @@ export type ColumnFormatterConfig =
   | { kind: "iotdb-timestamp"; precision: IoTDBTimestampPrecision; timezone: string }
   | { kind: "json-path"; path: string }
   | { kind: "mask"; prefix: number; suffix: number }
+  | { kind: "number"; useGrouping: boolean; decimalPlaces?: number }
   | {
       kind: "foreign-key-display";
       referenceMode?: "foreign-key" | "manual";
@@ -135,6 +147,89 @@ export interface ColumnFormatterKeyParts {
 
 export function buildColumnFormatterKey(parts: ColumnFormatterKeyParts): string {
   return [parts.connectionId, parts.database ?? "", parts.schema ?? "", parts.tableName, parts.column].join("::");
+}
+
+export interface ColumnFormatterKeyContext {
+  connectionId: string;
+  database?: string;
+  schema?: string;
+  databaseType?: string;
+  /** Result-column label (may be an alias). */
+  resultColumn: string;
+  /** Physical source column label when the grid already knows it. */
+  sourceColumn?: string;
+  /** Resolved physical source identity of a query result column, when known. */
+  displaySource?: {
+    database?: string;
+    schema?: string;
+    tableName?: string;
+    sourceColumn?: string;
+  };
+  tableMeta?: {
+    database?: string;
+    schema?: string;
+    tableName: string;
+  };
+}
+
+// Ordered formatter-key candidates for one grid column. keys[0] is the write
+// key: always the physical source identity, never the current tab namespace,
+// so a same-named table in another database or schema must not inherit this
+// column's formatter. Remaining keys are read/clear fallbacks for configs
+// saved by other surfaces or older versions.
+//
+// MySQL-family query metadata mirrors the database into the schema slot while
+// table-view keys have always used an empty schema. Keep the shared
+// empty-schema key first so a formatter saved from a query result is written
+// to (and read by) the table view too, and retain the mirrored spelling only
+// as a read fallback for configs saved by older versions.
+export function columnFormatterKeys(context: ColumnFormatterKeyContext): string[] {
+  const { connectionId, database, schema, databaseType, resultColumn } = context;
+  const displaySource = context.displaySource;
+  // A joined-result source key is only meaningful within one query. Do not
+  // guess a formatter key for cached legacy mappings that lack a physical table.
+  if (displaySource && !displaySource.tableName) return [];
+
+  const tableMeta = displaySource?.tableName
+    ? {
+        database: displaySource.database,
+        schema: displaySource.schema,
+        tableName: displaySource.tableName,
+      }
+    : context.tableMeta;
+  if (!tableMeta?.tableName) return [];
+
+  const sourceColumn = displaySource?.sourceColumn || context.sourceColumn || resultColumn;
+  const keys = new Set<string>();
+  const primaryDatabase = tableMeta.database?.trim() || database;
+  const primarySchema = tableMeta.schema ?? schema;
+  const isMysql = databaseType === "mysql";
+  const mirroredSchema = isMysql ? primaryDatabase : undefined;
+  const addKey = (keyDatabase: string | undefined, keySchema: string | undefined, column: string) => {
+    keys.add(
+      buildColumnFormatterKey({
+        connectionId,
+        database: keyDatabase,
+        schema: keySchema,
+        tableName: tableMeta.tableName,
+        column,
+      }),
+    );
+  };
+
+  if (isMysql) addKey(primaryDatabase, "", sourceColumn);
+  addKey(primaryDatabase, primarySchema, sourceColumn);
+  if (displaySource?.tableName) return [...keys];
+
+  const databases = [...new Set([primaryDatabase, database, context.tableMeta?.database])];
+  const schemas = [...new Set([primarySchema, schema, context.tableMeta?.schema, "", mirroredSchema])];
+  const columns = [...new Set([sourceColumn, resultColumn])];
+  for (const keyDatabase of databases) {
+    for (const keySchema of schemas) {
+      for (const column of columns) addKey(keyDatabase, keySchema, column);
+    }
+  }
+  return [...keys];
 }
 
 export function normalizeColumnFormatter(value: unknown): ColumnFormatterConfig | undefined {
@@ -160,6 +255,12 @@ export function normalizeColumnFormatter(value: unknown): ColumnFormatterConfig 
     if (!Number.isInteger(config.prefix) || !Number.isInteger(config.suffix)) return undefined;
     if ((config.prefix as number) < 0 || (config.suffix as number) < 0) return undefined;
     return { kind: "mask", prefix: config.prefix as number, suffix: config.suffix as number };
+  }
+
+  if (config.kind === "number") {
+    if (typeof config.useGrouping !== "boolean") return undefined;
+    if (config.decimalPlaces !== undefined && (!Number.isInteger(config.decimalPlaces) || config.decimalPlaces < 0 || config.decimalPlaces > 20)) return undefined;
+    return { kind: "number", useGrouping: config.useGrouping, decimalPlaces: config.decimalPlaces };
   }
 
   if (config.kind === "foreign-key-display") {
@@ -201,6 +302,8 @@ const FOREIGN_KEY_DISPLAY_FILTER_MODES = new Set<DataGridContextFilterMode>([
   "not-like",
   "begins-with",
   "ends-with",
+  "not-begins-with",
+  "not-ends-with",
   "less-than",
   "less-than-or-equal",
   "greater-than",
@@ -335,12 +438,15 @@ export function iotdbTimestampFractionDigits(precision: IoTDBTimestampPrecision)
 
 function iotdbTimestampTimeZone(urlParams: string | undefined): string {
   const params = new URLSearchParams(urlParams ?? "");
-  const candidate = params.get("time_zone") || params.get("timezone") || params.get("zone_id") || "UTC";
+  // Keep display aligned with the IoTDB Go client's default session zone.
+  // Otherwise an unconfigured connection interprets SQL literals in
+  // Asia/Shanghai but the grid renders the returned epoch in UTC.
+  const candidate = params.get("time_zone") || params.get("timezone") || params.get("zone_id") || "Asia/Shanghai";
   try {
     dayjs(0).tz(candidate);
     return candidate;
   } catch {
-    return "UTC";
+    return "Asia/Shanghai";
   }
 }
 
@@ -349,7 +455,7 @@ export function formatTemporalRowsForExport<T extends CellValue>(rows: readonly 
   if (!normalizedPattern) return rows.map((row) => [...row]);
   return rows.map((row) =>
     row.map((value, index) => {
-      if (!isTemporalColumnType(columnTypes[index])) return value;
+      if (value === null || !isTemporalColumnType(columnTypes[index])) return value;
       return formatTemporalValueForExport(value, normalizedPattern) as T;
     }),
   );
@@ -384,11 +490,42 @@ export function applyColumnFormatter(value: CellValue, formatter: ColumnFormatte
     if (formatter.kind === "datetime") return formatDateTime(value, formatter.unit, formatter.pattern, formatter.timezone);
     if (formatter.kind === "json-path") return formatJsonPath(value, formatter.path);
     if (formatter.kind === "mask") return formatMask(value, formatter);
+    if (formatter.kind === "number") return formatNumber(value, formatter);
     if (formatter.kind === "custom-template") return formatCustomTemplate(value, formatter.template);
     return displayCellValue(value);
   } catch {
     return displayCellValue(value);
   }
+}
+
+function formatNumber(value: CellValue, formatter: Extract<ColumnFormatterConfig, { kind: "number" }>): string {
+  if (typeof value !== "number" && typeof value !== "string") return displayCellValue(value);
+  if (formatter.decimalPlaces !== undefined && (!Number.isInteger(formatter.decimalPlaces) || formatter.decimalPlaces < 0 || formatter.decimalPlaces > 20)) return displayCellValue(value);
+  const text = String(value).trim();
+  // Bound work before expanding exponents or parsing arbitrary numeric text.
+  if (text.length > 1000) return displayCellValue(value);
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
+  if (!match) return displayCellValue(value);
+  const [, sign, integerDigits, fractionDigits = "", exponentText = "0"] = match;
+  if (!integerDigits && !fractionDigits) return displayCellValue(value);
+  const exponent = Number(exponentText);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1000) return displayCellValue(value);
+
+  // Keep DECIMAL/BIGINT text exact instead of converting it through a double.
+  const digits = integerDigits + fractionDigits;
+  const point = integerDigits.length + exponent;
+  let integer = digits.slice(0, Math.max(0, point)).padEnd(Math.max(0, point), "0").replace(/^0+/, "") || "0";
+  let fraction = "0".repeat(Math.max(0, -point)) + digits.slice(Math.max(0, point));
+  if (formatter.decimalPlaces !== undefined) {
+    const places = formatter.decimalPlaces;
+    const kept = fraction.slice(0, places).padEnd(places, "0");
+    // Round half away from zero, including a carry into the integer part.
+    const rounded = (BigInt(integer + kept) + (Number(fraction[places] ?? "0") >= 5 ? 1n : 0n)).toString().padStart(places + 1, "0");
+    integer = rounded.slice(0, rounded.length - places);
+    fraction = places ? rounded.slice(-places) : "";
+  }
+  if (formatter.useGrouping) integer = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${sign === "-" ? "-" : ""}${integer}${fraction ? `.${fraction}` : ""}`;
 }
 
 function formatDateTime(value: CellValue, unit: DateTimeFormatterUnit, pattern: string, timezone: string | undefined): string {

@@ -26,6 +26,16 @@ func TestHandshakeAdvertisesNativeCapabilities(t *testing.T) {
 	}
 }
 
+func TestExecuteTransactionIsRejectedBeforeConnecting(t *testing.T) {
+	server := &server{}
+	_, err := server.executeStatements(map[string]json.RawMessage{
+		"statements": json.RawMessage(`["INSERT INTO metrics(device, time, value) VALUES ('d1', 1, 1)"]`),
+	}, true)
+	if err == nil || err.Error() != "IoTDB does not support transactions" {
+		t.Fatalf("expected unsupported transaction error, got %v", err)
+	}
+}
+
 func TestHandleLineClassifiesMissingSession(t *testing.T) {
 	response, _ := newRuntimeServer().handleLine(
 		`{"jsonrpc":"2.0","id":7,"method":"validate_session","params":{"agentSessionId":"missing"}}`,
@@ -57,6 +67,56 @@ func TestParseConnectionConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(config.NodeURLs, []string{"node1:6667", "node2:6667"}) {
 		t.Fatalf("unexpected cluster nodes: %#v", config.NodeURLs)
+	}
+}
+
+func TestParseConnectionConfigCompressionAliases(t *testing.T) {
+	tests := []struct {
+		name             string
+		connectionString string
+		urlParams        string
+		want             bool
+	}{
+		{name: "default disabled"},
+		{name: "documented enabled", urlParams: "enable_compression=true", want: true},
+		{name: "documented disabled", urlParams: "enable_compression=false"},
+		{name: "existing alias enabled", urlParams: "rpc_compression=true", want: true},
+		{name: "existing alias disabled", urlParams: "rpc_compression=false"},
+		{name: "JDBC alias enabled in URL parameters", urlParams: "rpc_compress=true", want: true},
+		{name: "JDBC alias false", urlParams: "rpc_compress=false"},
+		{
+			name:             "JDBC alias enabled in connection string",
+			connectionString: "jdbc:iotdb://localhost:6667/?rpc_compress=true",
+			want:             true,
+		},
+		{
+			name:             "URL parameters override same connection string key",
+			connectionString: "jdbc:iotdb://localhost:6667/?rpc_compress=true",
+			urlParams:        "rpc_compress=false",
+		},
+		{
+			name:      "documented option takes precedence",
+			urlParams: "enable_compression=false&rpc_compression=true&rpc_compress=true",
+		},
+		{
+			name:      "existing alias takes precedence over JDBC alias",
+			urlParams: "rpc_compression=false&rpc_compress=true",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := parseConnectionConfig(connectParams{
+				ConnectionString: test.connectionString,
+				URLParams:        test.urlParams,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.EnableCompression != test.want {
+				t.Fatalf("EnableCompression = %t, want %t", config.EnableCompression, test.want)
+			}
+		})
 	}
 }
 
@@ -178,6 +238,34 @@ func TestTreeTimeColumnPresentationDoesNotRewriteOrdinaryInt64(t *testing.T) {
 	}
 }
 
+func TestTreeTimeAggregationColumnsPresentAsTimestamps(t *testing.T) {
+	columns := []string{
+		"max_time(root.db.d1.s1)",
+		"MIN_TIME(root.db.d1.s1)",
+		" max_time(root.db.d1.s1) ",
+		"max_by(Time,root.db.d1.s1)",
+		"MIN_BY( time , root.db.d1.s1 )",
+		"avg(root.db.d1.s1)",
+		"count(root.db.d1.s1)",
+	}
+	got := normalizedColumnTypes([]string{"INT64", "INT64", "INT64", "INT64", "INT64", "DOUBLE", "INT64"}, columns, client.TreeSqlDialect, "ms")
+	want := []string{"TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "TIMESTAMP(ms)", "DOUBLE", "INT64"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected tree aggregation types: %#v", got)
+	}
+	if name := normalizedColumnTypes([]string{"INT64"}, []string{"max_timer(root.db.d1.s1)"}, client.TreeSqlDialect, "ms"); !reflect.DeepEqual(name, []string{"INT64"}) {
+		t.Fatalf("unrelated prefix must stay INT64: %#v", name)
+	}
+	if table := normalizedColumnTypes([]string{"INT64"}, []string{"max_time(t1.s1)"}, client.TableSqlDialect, "ms"); !reflect.DeepEqual(table, []string{"INT64"}) {
+		t.Fatalf("table dialect must stay INT64: %#v", table)
+	}
+	for _, column := range []string{"max_by(s1,time)", "max_by(event_time,s1)", "max_bytes(time,s1)"} {
+		if got := normalizedColumnTypes([]string{"INT64"}, []string{column}, client.TreeSqlDialect, "ms"); !reflect.DeepEqual(got, []string{"INT64"}) {
+			t.Fatalf("non-time max_by result %q must stay INT64: %#v", column, got)
+		}
+	}
+}
+
 func TestClassifyIoTDBErrors(t *testing.T) {
 	canceled := classifyRPCError("execute_query", "session-1", context.Canceled)
 	if canceled.Data.Category != "canceled" || canceled.Data.SessionDisposition != "quarantine" {
@@ -199,6 +287,31 @@ func TestDecodeQueryOptions(t *testing.T) {
 	options := queryOptionsFromParams(params)
 	if options.SQL != "SHOW DATABASES" || options.MaxRows != 100 || options.FetchSize != 25 || options.TimeoutSecs != 5 {
 		t.Fatalf("unexpected query options: %#v", options)
+	}
+}
+
+func TestIsQueryStatementRecognizesListStatements(t *testing.T) {
+	tests := []struct {
+		sql  string
+		want bool
+	}{
+		{sql: "LIST USER", want: true},
+		{sql: "list role", want: true},
+		{sql: "  LiSt PRIVILEGES OF USER root;  ", want: true},
+		{sql: "\tLIST PRIVILEGES OF ROLE dbx7359_role\n", want: true},
+		{sql: "SHOW VERSION", want: true},
+		{sql: "SELECT * FROM root.dbx_7359.d", want: true},
+		{sql: ""},
+		{sql: "   ;   "},
+		{sql: "INSERT INTO root.dbx_7359.d(time,s) VALUES(1,1)"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.sql, func(t *testing.T) {
+			if got := isQueryStatement(trimStatementSQL(test.sql)); got != test.want {
+				t.Fatalf("isQueryStatement(%q) = %t, want %t", test.sql, got, test.want)
+			}
+		})
 	}
 }
 
@@ -262,4 +375,105 @@ func (s *blockingIoTDBSession) Close() error {
 		close(s.closed)
 	}
 	return nil
+}
+
+func TestTimeoutMillisecondsMapsNoLimitToABoundedHugeBudget(t *testing.T) {
+	// dbx's "no limit" setting is 0. Probing 1.3.7 shows IoTDB's per-query
+	// timeout has no wire-level "disable": 0 and negatives fall back to the
+	// server's query_timeout_threshold (60 s default), so the no-limit setting
+	// maps to a 100-year budget that can never fire within int64 deadline
+	// arithmetic (#13935).
+	noLimit := timeoutMilliseconds(0)
+	if noLimit == nil || *noLimit != hundredYearsMs {
+		t.Fatalf("timeoutMilliseconds(0) = %v, want pointer to %d", noLimit, hundredYearsMs)
+	}
+	positive := timeoutMilliseconds(90)
+	if positive == nil || *positive != 90000 {
+		t.Fatalf("timeoutMilliseconds(90) = %v, want pointer to 90000", positive)
+	}
+	if negative := timeoutMilliseconds(-1); negative != nil {
+		t.Fatalf("timeoutMilliseconds(-1) = %v, want nil", *negative)
+	}
+}
+
+const hundredYearsMs = 100 * 365 * 24 * int64(time.Hour) / int64(time.Millisecond)
+
+type timeoutRecordingSession struct {
+	received []*int64
+}
+
+func (s *timeoutRecordingSession) ExecuteQueryStatement(_ context.Context, _ string, timeoutMs *int64) (*client.SessionDataSet, error) {
+	s.received = append(s.received, timeoutMs)
+	return nil, errors.New("recorded")
+}
+
+func (s *timeoutRecordingSession) ExecuteNonQueryStatement(context.Context, string) error {
+	return errors.New("not implemented")
+}
+
+func (s *timeoutRecordingSession) Close() error { return nil }
+
+func TestQueryValuesSendsHugeBudgetForNoLimit(t *testing.T) {
+	recording := &timeoutRecordingSession{}
+	connected := &sessionClient{session: recording, dialect: client.TreeSqlDialect}
+	server := &server{client: connected}
+
+	_, _ = server.queryValues("SELECT value FROM root.dbx_13935.d", "", 10, 0)
+
+	if len(recording.received) != 1 {
+		t.Fatalf("ExecuteQueryStatement calls = %d, want 1", len(recording.received))
+	}
+	timeout := recording.received[0]
+	if timeout == nil || *timeout != hundredYearsMs {
+		t.Fatalf("query timeout = %v, want the 100-year no-limit budget", timeout)
+	}
+}
+
+type timeoutCaptureSession struct {
+	capturedTimeout []*int64
+	capturedContext []context.Context
+}
+
+func (s *timeoutCaptureSession) ExecuteQueryStatementWithContext(ctx context.Context, _ string, timeoutMs *int64) (*client.SessionDataSet, error) {
+	s.capturedTimeout = append(s.capturedTimeout, timeoutMs)
+	s.capturedContext = append(s.capturedContext, ctx)
+	return nil, errors.New("recorded")
+}
+
+func (s *timeoutCaptureSession) ExecuteStatementWithContext(context.Context, string) (*client.SessionDataSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *timeoutCaptureSession) Close() error { return nil }
+
+// The production adapter must forward the per-query timeout to the session
+// layer instead of dropping it: whatever timeoutMilliseconds produced (a
+// positive budget, or the 100-year no-limit budget) has to reach the session
+// call untouched, together with the caller's context (#13935).
+func TestNativeSessionForwardsQueryTimeoutToClient(t *testing.T) {
+	recording := &timeoutCaptureSession{}
+	session := &nativeIoTDBSession{session: recording}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	zero := int64(0)
+	for _, timeout := range []*int64{nil, &zero} {
+		if _, err := session.ExecuteQueryStatement(ctx, "SELECT value FROM root.dbx.d", timeout); err == nil {
+			t.Fatal("expected the recorded error to surface")
+		}
+	}
+	if len(recording.capturedTimeout) != 2 {
+		t.Fatalf("ExecuteQueryStatementWithContext calls = %d, want 2", len(recording.capturedTimeout))
+	}
+	if recording.capturedTimeout[0] != nil {
+		t.Fatalf("first call timeout = %v, want nil passthrough", *recording.capturedTimeout[0])
+	}
+	if recording.capturedTimeout[1] == nil || *recording.capturedTimeout[1] != 0 {
+		t.Fatalf("second call timeout = %v, want pointer to 0 (no limit)", recording.capturedTimeout[1])
+	}
+	for _, captured := range recording.capturedContext {
+		if captured != ctx {
+			t.Fatal("the caller's context must reach the session layer for cancellation")
+		}
+	}
 }
